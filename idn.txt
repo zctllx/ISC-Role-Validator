@@ -1,0 +1,283 @@
+require "net/http"
+require "uri"
+require "cgi"
+require "json"
+require "logger"
+
+module IDN
+
+  STATUS_SUCCESS = 0
+  STATUS_ERROR = 1
+  STATUS_RETRY = 2
+
+  @@clientId = nil
+  @@clientSecret = nil
+  @@accessToken = nil
+  @@apiUrl = nil
+  @@rateLimitTimeout = nil
+  @@header = {
+    "Content-Type" => "application/json",
+    "X-CSRF-Token" => "nocheck",
+    "User-Agent"   => "spps-idn-bulk-configuration"
+  }
+  @@logger = Logger.new(STDOUT)
+  @@logger.level = Logger::DEBUG
+
+  def self.setIDNParams(clientId,clientSecret,apiUrl)
+    @@clientId = clientId
+    @@clientSecret = clientSecret
+    @@apiUrl = apiUrl
+    # Create the header for auth
+    self.create_header
+  end
+
+  def self.create_header
+    success, message, @@accessToken = api_post(endpoint: "/oauth/token?grant_type=client_credentials&client_id=#{@@clientId}&client_secret=#{@@clientSecret}",attributeKey: "access_token")
+    if (success) then
+      if(present(@@accessToken)) then
+
+        @@header["Authorization"] = "Bearer #{@@accessToken}"
+        puts "INFO    : Role Importer Tool : Success : Retrieved Access Token"
+      else
+        puts "ERROR   : Role Importer Tool : Failure : Retrieved Access Token is empty"
+      end
+    else
+      puts "ERROR   : Role Importer Tool : Failure : Retrieved Access Token failed with message #{message}"
+    end
+  end
+
+  # Helper functins
+  def self.present(o)
+    return o == nil || o.empty? ? false : true
+  end
+
+  # API calls
+
+  def self.handle_api_response(response)
+    case response
+    when Net::HTTPSuccess
+      status = STATUS_SUCCESS
+		  message = "Success"
+    when Net::HTTPUnauthorized
+      status = STATUS_ERROR
+		  message = "UnAuthorized (401)"
+    when Net::HTTPServerError
+      status = STATUS_ERROR
+		  message = "Server Error (500)"
+    when Net::HTTPTooManyRequests
+      status = STATUS_RETRY
+  	  message = response['Retry-After'].to_i
+      # Sometimes the API answers a 0 delay for retrying, we don't want that.
+      # Let's artificially set it to 10 instead
+      message = message = 0 ? 10 : message
+    else
+      status = STATUS_ERROR
+      message = response.body
+    end
+    return status, message
+  end
+
+  def self.wait_rate_limit(delay)
+    print "INFO    : Role Tool Importer : We have hit the API Rate Limit  and are instructed to sleep for #{delay} seconds : "
+    delay.times {|i|
+      sleep(1)
+      print "#"
+    }
+    print "\n"
+  end
+
+  def self.api_post(endpoint: , body: nil , attributeKey: nil, headerKey: nil)
+
+    # Set the header properly
+    @@header["Content-Type"] = "application/json"
+    uri = URI.parse( "#{@@apiUrl}/#{endpoint}" )
+    http = Net::HTTP.new( uri.host, uri.port )
+    http.use_ssl = true
+
+    # Make the call
+    request = Net::HTTP::Post.new( uri.request_uri, @@header )
+
+    # Get the Body
+    request.body = body.to_json
+    response = http.request( request )
+
+    # Handle response
+    status,message = handle_api_response(response)
+
+    # If we are told to wait and retry, then waith and retry
+    if status == STATUS_RETRY then
+      # Sometimes we are told to retry several times ...
+      loop do
+        wait_rate_limit(message)
+        response = http.request( request )
+        status,message = handle_api_response(response)
+        break if status != STATUS_RETRY
+      end
+    end
+
+    returnAttribute = present(response.body) && present(attributeKey) ? JSON.parse(response.body)[attributeKey] : present(response.body) ? JSON.parse(response.body) : nil
+    returnHeader = !headerKey.nil? ? response[headerKey] : nil
+
+    return status == STATUS_SUCCESS, message, returnAttribute, returnHeader
+  end
+
+  def self.api_patch(endpoint: , body: nil , attributeKey: nil, headerKey: nil)
+    # Set the header properly
+    @@header["Content-Type"] = "application/json-patch+json"
+    uri = URI.parse( "#{@@apiUrl}/#{endpoint}" )
+
+    http = Net::HTTP.new( uri.host, uri.port )
+    http.use_ssl = true
+
+    # Make the call
+    request = Net::HTTP::Patch.new( uri.request_uri, @@header )
+
+    # Get the Body
+    request.body = body.to_json
+    response = http.request( request )
+    # Handle response
+    status,message = handle_api_response(response)
+
+    # If we are told to wait and retry, then waith and retry
+    if status == STATUS_RETRY then
+      # Sometimes we are told to retry several times ...
+      loop do
+        wait_rate_limit(message)
+        response = http.request( request )
+        status,message = handle_api_response(response)
+        break if status != STATUS_RETRY
+      end
+    end
+
+    returnAttribute = present(response.body) && present(attributeKey) ? JSON.parse(response.body)[attributeKey] : present(response.body) ? JSON.parse(response.body) : nil
+    returnHeader = !headerKey.nil? ? response[headerKey] : nil
+
+    return status == STATUS_SUCCESS, message, returnAttribute, returnHeader
+  end
+
+  def self.api_get(endpoint: , attributeKey: nil, headerKey: nil)
+
+    # Set the header properly
+    @@header["Content-Type"] = "application/json"
+    uri = URI.parse( "#{@@apiUrl}/#{endpoint}" )
+    http = Net::HTTP.new( uri.host, uri.port )
+    http.use_ssl = true
+    # Make the call
+    request = Net::HTTP::Get.new( uri.request_uri, @@header )
+
+    # Get the Body
+    response = http.request( request )
+
+    # Handle response
+    status,message = handle_api_response(response)
+
+    # If we are told to wait and retry, then waith and retry
+    if status == STATUS_RETRY then
+      # Sometimes we are told to retry several times ...
+      loop do
+        wait_rate_limit(message)
+        response = http.request( request )
+        status,message = handle_api_response(response)
+        break if status != STATUS_RETRY
+      end
+    end
+
+    returnAttribute = present(response.body) && present(attributeKey) ? JSON.parse(response.body)[attributeKey] : present(response.body) ? JSON.parse(response.body) : nil
+    returnHeader = !headerKey.nil? ? response[headerKey] : nil
+
+    return status == STATUS_SUCCESS, message, returnAttribute, returnHeader
+  end
+
+  def self.api_delete(endpoint:)
+
+    # Set the header properly
+    @@header["Content-Type"] = "application/json"
+    uri = URI.parse( "#{@@apiUrl}/#{endpoint}" )
+    http = Net::HTTP.new( uri.host, uri.port )
+    http.use_ssl = true
+    # Make the call
+    request = Net::HTTP::Delete.new( uri.request_uri, @@header )
+
+    # Get the Body
+    response = http.request( request )
+
+    # Handle response
+    status,message = handle_api_response(response)
+
+    # If we are told to wait and retry, then waith and retry
+    if status == STATUS_RETRY then
+      # Sometimes we are told to retry several times ...
+      loop do
+        wait_rate_limit(message)
+        response = http.request( request )
+        status,message = handle_api_response(response)
+        break if status != STATUS_RETRY
+      end
+    end
+
+    return status == STATUS_SUCCESS, message
+  end
+
+
+  def self.api_put(endpoint: , body: nil , attributeKey: nil, headerKey: nil)
+
+    # Set the header properly
+    @@header["Content-Type"] = "application/json"
+    uri = URI.parse( "#{@@apiUrl}/#{endpoint}" )
+    http = Net::HTTP.new( uri.host, uri.port )
+    http.use_ssl = true
+
+    # Make the call
+    request = Net::HTTP::Put.new( uri.request_uri, @@header )
+
+    # Get the Body
+    request.body = body.to_json
+    response = http.request( request )
+
+    # Handle response
+    status,message = handle_api_response(response)
+
+    # If we are told to wait and retry, then wait and retry
+    if status == STATUS_RETRY then
+      # Sometimes we are told to retry several times ...
+      loop do
+        wait_rate_limit(message)
+        response = http.request( request )
+        status,message = handle_api_response(response)
+        break if status != STATUS_RETRY
+      end
+    end
+
+    returnAttribute = present(response.body) && present(attributeKey) ? JSON.parse(response.body)[attributeKey] : present(response.body) ? JSON.parse(response.body) : nil
+    returnHeader = !headerKey.nil? ? response[headerKey] : nil
+
+    return status == STATUS_SUCCESS, message, returnAttribute, returnHeader
+  end
+
+## Logging functions
+def self.debug(message)
+    @@logger.debug(message)
+end
+
+def self.warn(message)
+  @@logger.warn(message)
+end
+
+def self.info(message)
+  @@logger.info(message)
+end
+
+## IDN Objects
+# Identity
+def self.get_identity_id(name)
+  result,message,id = api_get(endpoint:"/beta/identities?filters=alias eq \"#{name}\"")
+  if id.length > 1 || !present(id)
+    message = "None or more than one id for this name : #{name}"
+    result = false
+  else
+    id = id[0]["id"]
+  end
+  return result, message, id
+end
+
+end # module IDN
